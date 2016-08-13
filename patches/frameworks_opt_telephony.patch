@@ -1,0 +1,162 @@
+From 683ba0d4c8ba96f17df01f97920abed98eceab1a Mon Sep 17 00:00:00 2001
+From: Humberto Borba <humberos@gmail.com>
+Date: Wed, 28 Jan 2015 10:29:40 -0200
+Subject: [PATCH 1/2] telephony: fix data connection
+
+the getSetupRilRadioTechnology requires a parameter to work properly
+
+Signed-off-by: Humberto Borba <humberos@gmail.com>
+Change-Id: I81a77639444dc53abbbdd8c374f317b2d04a6043
+
+Conflicts:
+	src/java/com/android/internal/telephony/dataconnection/DataConnection.java
+---
+ .../telephony/dataconnection/DataConnection.java        | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/java/com/android/internal/telephony/dataconnection/DataConnection.java b/src/java/com/android/internal/telephony/dataconnection/DataConnection.java
+index 61e293d..7a0fa41 100644
+--- a/src/java/com/android/internal/telephony/dataconnection/DataConnection.java
++++ b/src/java/com/android/internal/telephony/dataconnection/DataConnection.java
+@@ -575,7 +575,7 @@ public final class DataConnection extends StateMachine {
+         }
+ 
+         mPhone.mCi.setupDataCall(
+-                Integer.toString(cp.mRilRat + 2),
++                Integer.toString(getSetupRilRadioTechnology(cp.mRilRat)),
+                 Integer.toString(cp.mProfileId),
+                 mApnSetting.apn, mApnSetting.user, mApnSetting.password,
+                 Integer.toString(authType),
+@@ -726,6 +726,21 @@ public final class DataConnection extends StateMachine {
+         if (DBG) log("NotifyDisconnectCompleted DisconnectParams=" + dp);
+     }
+ 
++    private int getSetupRilRadioTechnology(int rilRadioTechnology) {
++        if (mPhone.mCi.getRilVersion() < 6) {
++            int phoneType = mPhone.getPhoneType();
++            if (phoneType == PhoneConstants.PHONE_TYPE_GSM) {
++                return RILConstants.SETUP_DATA_TECH_GSM;
++            } else if (phoneType == PhoneConstants.PHONE_TYPE_CDMA) {
++                return RILConstants.SETUP_DATA_TECH_CDMA;
++            } else {
++                throw new RuntimeException("Unknown phoneType " + phoneType + ", should not happen");
++            }
++        } else {
++            return rilRadioTechnology + 2;
++        }
++    }
++
+     /*
+      * **************************************************************************
+      * Begin Members and methods owned by DataConnectionTracker but stored
+-- 
+2.7.4
+
+
+From bcf3b39161f9148a96b7c5f031a5b41fe168d41a Mon Sep 17 00:00:00 2001
+From: JooJooBee666 <desire4homicide@gmail.com>
+Date: Sat, 24 Jan 2015 16:19:38 -0500
+Subject: [PATCH 2/2] DcTracker: Handle null waitingApns properly
+
+If getWaitingApns is null, com.android.phone crashes due to
+no valid checking for a null waitingApns.
+
+Also disable debug logging (DBG)
+
+logs:
+    http://paste.omnirom.org/view/0c1ae74f
+
+Signed-off-by: Humberto Borba <humberos@gmail.com>
+Change-Id: Ib45291e321d59fd9b2daac0722e429115842737d
+---
+ .../telephony/dataconnection/DcTracker.java        | 35 +++++++++++++++-------
+ .../telephony/dataconnection/DcTrackerBase.java    |  2 +-
+ 2 files changed, 26 insertions(+), 11 deletions(-)
+
+diff --git a/src/java/com/android/internal/telephony/dataconnection/DcTracker.java b/src/java/com/android/internal/telephony/dataconnection/DcTracker.java
+index 0c0c7d1..ed185be 100644
+--- a/src/java/com/android/internal/telephony/dataconnection/DcTracker.java
++++ b/src/java/com/android/internal/telephony/dataconnection/DcTracker.java
+@@ -946,8 +946,12 @@ public class DcTracker extends DcTrackerBase {
+             }
+ 
+             if (DBG) {
+-                log("trySetupData: call setupData, waitingApns : "
++                if (apnContext.getWaitingApns() == null) {
++                    log("trySetupData: call setupData, waitingApns : null");
++                } else {
++                    log("trySetupData: call setupData, waitingApns : "
+                         + apnListToString(apnContext.getWaitingApns()));
++                }
+             }
+             boolean retValue = setupData(apnContext, radioTech);
+             notifyOffApnsOfAvailability(apnContext.getReason());
+@@ -2098,10 +2102,16 @@ public class DcTracker extends DcTrackerBase {
+ 
+             apnContext.removeWaitingApn(apnContext.getApnSetting());
+             if (DBG) {
+-                log(String.format("onDataSetupComplete: WaitingApns.size=%d" +
++                if (apnContext.getWaitingApns() == null) {
++                    log(String.format("onDataSetupComplete: WaitingApns.size = null" +
+                         " WaitingApnsPermFailureCountDown=%d",
+-                        apnContext.getWaitingApns().size(),
+                         apnContext.getWaitingApnsPermFailCount()));
++                } else {
++                    log(String.format("onDataSetupComplete: WaitingApns.size=%d" +
++                            " WaitingApnsPermFailureCountDown=%d",
++                            apnContext.getWaitingApns().size(),
++                            apnContext.getWaitingApnsPermFailCount()));
++                }
+             }
+             handleError = true;
+         }
+@@ -2172,7 +2182,7 @@ public class DcTracker extends DcTrackerBase {
+         if (apnContext == null) return;
+ 
+         // See if there are more APN's to try
+-        if (apnContext.getWaitingApns().isEmpty()) {
++        if (apnContext.getWaitingApns() == null || apnContext.getWaitingApns().isEmpty()) {
+             apnContext.setState(DctConstants.State.FAILED);
+             mPhone.notifyDataConnection(Phone.REASON_APN_FAILED, apnContext.getApnType());
+ 
+@@ -2732,13 +2742,18 @@ public class DcTracker extends DcTrackerBase {
+     }
+ 
+     private String apnListToString (ArrayList<ApnSetting> apns) {
+-        StringBuilder result = new StringBuilder();
+-        for (int i = 0, size = apns.size(); i < size; i++) {
+-            result.append('[')
+-                  .append(apns.get(i).toString())
+-                  .append(']');
++        if (apns == null) {
++            log("apnListToString: apns = null.");
++            return "";
++        } else {
++            StringBuilder result = new StringBuilder();
++            for (int i = 0, size = apns.size(); i < size; i++) {
++                result.append('[')
++                      .append(apns.get(i).toString())
++                      .append(']');
++            }
++            return result.toString();
+         }
+-        return result.toString();
+     }
+ 
+     protected void setPreferredApn(int pos) {
+diff --git a/src/java/com/android/internal/telephony/dataconnection/DcTrackerBase.java b/src/java/com/android/internal/telephony/dataconnection/DcTrackerBase.java
+index b1423e7..8f76081 100644
+--- a/src/java/com/android/internal/telephony/dataconnection/DcTrackerBase.java
++++ b/src/java/com/android/internal/telephony/dataconnection/DcTrackerBase.java
+@@ -81,7 +81,7 @@ import java.util.PriorityQueue;
+  * {@hide}
+  */
+ public abstract class DcTrackerBase extends Handler {
+-    protected static final boolean DBG = true;
++    protected static final boolean DBG = false;
+     protected static final boolean VDBG = false; // STOPSHIP if true
+     protected static final boolean VDBG_STALL = false; // STOPSHIP if true
+     protected static final boolean RADIO_TESTS = false;
+-- 
+2.7.4
+

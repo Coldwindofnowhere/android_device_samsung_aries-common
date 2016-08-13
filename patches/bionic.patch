@@ -1,0 +1,1041 @@
+From b4ff2b08d46f67c5511ebbf2158ddf8c16810350 Mon Sep 17 00:00:00 2001
+From: "Christopher R. Palmer" <crpalmer@gmail.com>
+Date: Tue, 3 Nov 2015 16:44:44 -0500
+Subject: [PATCH 01/10] linker: Add support for dynamic "shim" libs
+
+Add a new environment variable
+
+LD_SHIM_LIBS
+
+that is a colon (":") separated list of vertical bar ("|") separated pairs.
+The pairs are the name for a soinfo reference (executable or shared library)
+followed by the name of the shim library to load.  For example:
+
+LD_SHIM_LIBS=rmt_storage|libshim_ioprio.so:/system/lib/libicuuv.so|libshim_icu53.so
+
+will instruct the linker to load the dynamic library libshim_ioprio.so
+whenver rmt_storage is executed [*] and will load libshim_icu53.so whenever
+any executable or other shared library links against /system/lib/libicuuv.so.
+
+There are no restrictions against circular references.  In this example,
+libshim_icu53.so can link against libicuuv.so which provides a simple and
+convenient means of adding compatibility symbols.
+
+[*] Note that the absolute path is not available to the linker and therefore
+using the name of executables does depend on the invocation and therefore
+should only be used if absolutely necessary.  That is, running
+/system/bin/rmt_storage would not load any shim libs in this example because
+it does not match the name of the invocation of the command.
+
+If you have trouble determining the sonames being loaded, you can also set
+the environment variable LD_DEBUG=1 which will cause additional information
+to be logged to help trace the detection of the shim libs.
+
+Change-Id: I0ef80fa466167f7bcb7dac90842bef1c3cf879b6
+---
+ linker/linker.cpp | 63 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 63 insertions(+)
+
+diff --git a/linker/linker.cpp b/linker/linker.cpp
+index 7909241..a40d08b 100644
+--- a/linker/linker.cpp
++++ b/linker/linker.cpp
+@@ -890,6 +890,60 @@ typedef linked_list_t<soinfo> SoinfoLinkedList;
+ typedef linked_list_t<const char> StringLinkedList;
+ typedef linked_list_t<LoadTask> LoadTaskList;
+ 
++static soinfo* find_library(const char* name, int rtld_flags, const android_dlextinfo* extinfo);
++
++// g_ld_all_shim_libs maintains the references to memory as it used
++// in the soinfo structures and in the g_active_shim_libs list.
++
++static std::vector<std::string> g_ld_all_shim_libs;
++
++// g_active_shim_libs are all shim libs that are still eligible
++// to be loaded.  We must remove a shim lib from the list before
++// we load the library to avoid recursive loops (load shim libA
++// for libB where libA also links against libB).
++
++static linked_list_t<const std::string> g_active_shim_libs;
++
++static void parse_LD_SHIM_LIBS(const char* path) {
++  parse_path(path, " :", &g_ld_all_shim_libs);
++  for (const auto& pair : g_ld_all_shim_libs) {
++    g_active_shim_libs.push_back(&pair);
++  }
++}
++
++static bool shim_lib_matches(const char *shim_lib, const char *realpath) {
++  const char *sep = strchr(shim_lib, '|');
++  return sep != nullptr && strncmp(realpath, shim_lib, sep - shim_lib) == 0;
++}
++
++template<typename F>
++static bool shim_libs_for_each(const char *const path, F action) {
++  if (path == nullptr) return true;
++  INFO("finding shim libs for \"%s\"\n", path);
++  std::vector<const std::string *> matched;
++
++  g_active_shim_libs.for_each([&](const std::string *a_pair) {
++    const char *pair = a_pair->c_str();
++    if (shim_lib_matches(pair, path)) {
++      matched.push_back(a_pair);
++    }
++  });
++
++  g_active_shim_libs.remove_if([&](const std::string *a_pair) {
++    const char *pair = a_pair->c_str();
++    return shim_lib_matches(pair, path);
++  });
++
++  for (const auto& one_pair : matched) {
++    const char* const pair = one_pair->c_str();
++    const char* sep = strchr(pair, '|');
++    INFO("found shim lib \"%s\"\n", sep+1);
++    soinfo *child = find_library(sep+1, RTLD_GLOBAL, nullptr);
++    if (! child) return false;
++    action(child);
++  }
++  return true;
++}
+ 
+ // This function walks down the tree of soinfo dependencies
+ // in breadth-first order and
+@@ -922,6 +976,12 @@ static bool walk_dependencies_tree(soinfo* root_soinfos[], size_t root_soinfos_s
+     si->get_children().for_each([&](soinfo* child) {
+       visit_list.push_back(child);
+     });
++
++    if (!shim_libs_for_each(si->get_realpath(), [&](soinfo* child) {
++        visit_list.push_back(child);
++      })) {
++      return false;
++    }
+   }
+ 
+   return true;
+@@ -3209,9 +3269,11 @@ static ElfW(Addr) __linker_init_post_relocation(KernelArgumentBlock& args, ElfW(
+   // doesn't cost us anything.
+   const char* ldpath_env = nullptr;
+   const char* ldpreload_env = nullptr;
++  const char* ldshim_libs_env = nullptr;
+   if (!getauxval(AT_SECURE)) {
+     ldpath_env = getenv("LD_LIBRARY_PATH");
+     ldpreload_env = getenv("LD_PRELOAD");
++    ldshim_libs_env = getenv("LD_SHIM_LIBS");
+   }
+ 
+   INFO("[ android linker & debugger ]");
+@@ -3267,6 +3329,7 @@ static ElfW(Addr) __linker_init_post_relocation(KernelArgumentBlock& args, ElfW(
+   // Use LD_LIBRARY_PATH and LD_PRELOAD (but only if we aren't setuid/setgid).
+   parse_LD_LIBRARY_PATH(ldpath_env);
+   parse_LD_PRELOAD(ldpreload_env);
++  parse_LD_SHIM_LIBS(ldshim_libs_env);
+ 
+   somain = si;
+ 
+-- 
+2.7.4
+
+
+From a2ad7f6c3dc3a9976970ef7dd956222afcc3be63 Mon Sep 17 00:00:00 2001
+From: "Christopher R. Palmer" <crpalmer@gmail.com>
+Date: Sun, 15 Nov 2015 14:26:32 -0500
+Subject: [PATCH 02/10] linker: Fix the fact that shim libs do not properly
+ call constructors
+
+Change-Id: I34333e13443a154e675b853fa41442351bc4243a
+---
+ linker/linker.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/linker/linker.cpp b/linker/linker.cpp
+index a40d08b..0d0ff80 100644
+--- a/linker/linker.cpp
++++ b/linker/linker.cpp
+@@ -978,6 +978,7 @@ static bool walk_dependencies_tree(soinfo* root_soinfos[], size_t root_soinfos_s
+     });
+ 
+     if (!shim_libs_for_each(si->get_realpath(), [&](soinfo* child) {
++        si->add_child(child);
+         visit_list.push_back(child);
+       })) {
+       return false;
+-- 
+2.7.4
+
+
+From 046e5b1197313c23f210772f3139de33d66e56fa Mon Sep 17 00:00:00 2001
+From: "Christopher R. Palmer" <crpalmer@gmail.com>
+Date: Sun, 29 Nov 2015 08:28:10 -0500
+Subject: [PATCH 03/10] linker: Reset the active shim libs each time we do a
+ dlopen
+
+We use the active libs to avoid recursively trying to load the
+same library:
+
+A -> shimlibs add B -> depends on A -> shimlibs add B -> ...
+
+However, when we repeatedly dlopen the same library we need
+to reset the active shim libs to avoid failing to add B the
+second time we dlopen A.
+
+Change-Id: I27580e3d6a53858e8bca025d6c85f981cffbea06
+---
+ linker/linker.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/linker/linker.cpp b/linker/linker.cpp
+index 0d0ff80..f3c9620 100644
+--- a/linker/linker.cpp
++++ b/linker/linker.cpp
+@@ -904,13 +904,18 @@ static std::vector<std::string> g_ld_all_shim_libs;
+ 
+ static linked_list_t<const std::string> g_active_shim_libs;
+ 
+-static void parse_LD_SHIM_LIBS(const char* path) {
+-  parse_path(path, " :", &g_ld_all_shim_libs);
++static void reset_g_active_shim_libs(void) {
++  g_active_shim_libs.clear();
+   for (const auto& pair : g_ld_all_shim_libs) {
+     g_active_shim_libs.push_back(&pair);
+   }
+ }
+ 
++static void parse_LD_SHIM_LIBS(const char* path) {
++  parse_path(path, " :", &g_ld_all_shim_libs);
++  reset_g_active_shim_libs();
++}
++
+ static bool shim_lib_matches(const char *shim_lib, const char *realpath) {
+   const char *sep = strchr(shim_lib, '|');
+   return sep != nullptr && strncmp(realpath, shim_lib, sep - shim_lib) == 0;
+@@ -1753,6 +1758,7 @@ soinfo* do_dlopen(const char* name, int flags, const android_dlextinfo* extinfo)
+   }
+ 
+   ProtectedDataGuard guard;
++  reset_g_active_shim_libs();
+   soinfo* si = find_library(name, flags, extinfo);
+   if (si != nullptr) {
+     si->call_constructors();
+-- 
+2.7.4
+
+
+From 687307af777f3596de166f9e539d7547f56dd8b9 Mon Sep 17 00:00:00 2001
+From: "Christopher R. Palmer" <crpalmer@gmail.com>
+Date: Tue, 1 Dec 2015 07:10:36 -0500
+Subject: [PATCH 04/10] linker: Don't try to walk the g_active_shim_libs when
+ doing dlsym
+
+This is a bug in the original shim_lib implementation which was
+doing the shim lib resolution both when loading the libraries
+and when doing the dynamic symbol resolution.
+
+Change-Id: Ib2df0498cf551b3bbd37d7c351410b9908eb1795
+---
+ linker/linker.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/linker/linker.cpp b/linker/linker.cpp
+index f3c9620..f42813d 100644
+--- a/linker/linker.cpp
++++ b/linker/linker.cpp
+@@ -958,7 +958,7 @@ static bool shim_libs_for_each(const char *const path, F action) {
+ // walk_dependencies_tree returns false if walk was terminated
+ // by the action and true otherwise.
+ template<typename F>
+-static bool walk_dependencies_tree(soinfo* root_soinfos[], size_t root_soinfos_size, F action) {
++static bool walk_dependencies_tree(soinfo* root_soinfos[], size_t root_soinfos_size, bool do_shims, F action) {
+   SoinfoLinkedList visit_list;
+   SoinfoLinkedList visited;
+ 
+@@ -982,7 +982,7 @@ static bool walk_dependencies_tree(soinfo* root_soinfos[], size_t root_soinfos_s
+       visit_list.push_back(child);
+     });
+ 
+-    if (!shim_libs_for_each(si->get_realpath(), [&](soinfo* child) {
++    if (do_shims && !shim_libs_for_each(si->get_realpath(), [&](soinfo* child) {
+         si->add_child(child);
+         visit_list.push_back(child);
+       })) {
+@@ -999,7 +999,7 @@ static const ElfW(Sym)* dlsym_handle_lookup(soinfo* root, soinfo* skip_until,
+   const ElfW(Sym)* result = nullptr;
+   bool skip_lookup = skip_until != nullptr;
+ 
+-  walk_dependencies_tree(&root, 1, [&](soinfo* current_soinfo) {
++  walk_dependencies_tree(&root, 1, false, [&](soinfo* current_soinfo) {
+     if (skip_lookup) {
+       skip_lookup = current_soinfo != skip_until;
+       return true;
+@@ -1579,6 +1579,7 @@ static bool find_libraries(soinfo* start_with, const char* const library_names[]
+   walk_dependencies_tree(
+       start_with == nullptr ? soinfos : &start_with,
+       start_with == nullptr ? soinfos_count : 1,
++      true,
+       [&] (soinfo* si) {
+     local_group.push_back(si);
+     return true;
+-- 
+2.7.4
+
+
+From 4fc73b42458449de2149acfead142b3a732543d8 Mon Sep 17 00:00:00 2001
+From: "Christopher R. Palmer" <crpalmer@gmail.com>
+Date: Sat, 12 Dec 2015 06:10:09 -0500
+Subject: [PATCH 05/10] bionic: Do not allow LD_SHIM_LIBS for setuid
+ executables
+
+That's really not safe...
+
+Change-Id: If79af951830966fc21812cd0f60a8998a752a941
+---
+ libc/bionic/libc_init_common.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/libc/bionic/libc_init_common.cpp b/libc/bionic/libc_init_common.cpp
+index bd71628..ecde8d4 100644
+--- a/libc/bionic/libc_init_common.cpp
++++ b/libc/bionic/libc_init_common.cpp
+@@ -250,6 +250,7 @@ static bool __is_unsafe_environment_variable(const char* name) {
+       "LD_ORIGIN_PATH",
+       "LD_PRELOAD",
+       "LD_PROFILE",
++      "LD_SHIM_LIBS",
+       "LD_SHOW_AUXV",
+       "LD_USE_LOAD_BIAS",
+       "LOCALDOMAIN",
+-- 
+2.7.4
+
+
+From 7bfa7a8c416cc1d78e9b5de05f37b6881a229e77 Mon Sep 17 00:00:00 2001
+From: sooti <sooti85@gmail.com>
+Date: Sun, 13 Dec 2015 00:46:33 -0800
+Subject: [PATCH 06/10] Revert "bionic: Remove prelink support"
+
+This reverts commit 792df63bae3a71c529a977bab0189473aa837480.
+---
+ linker/Android.mk      |  4 ++++
+ linker/linker_phdr.cpp | 45 ++++++++++++++++++++++++++++++++++++++++++++-
+ linker/linker_phdr.h   |  9 ++++++++-
+ 3 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/linker/Android.mk b/linker/Android.mk
+index 9f578c9..95eb305 100644
+--- a/linker/Android.mk
++++ b/linker/Android.mk
+@@ -49,6 +49,10 @@ ifeq ($(TARGET_IS_64_BIT),true)
+ LOCAL_CPPFLAGS += -DTARGET_IS_64_BIT
+ endif
+ 
++ifeq ($(TARGET_NEEDS_BIONIC_PRELINK_SUPPORT),true)
++    LOCAL_CFLAGS += -DENABLE_PRELINK_SUPPORT
++endif
++
+ ifeq ($(TARGET_ENABLE_NON_PIE_SUPPORT),true)
+     LOCAL_CFLAGS += -DENABLE_NON_PIE_SUPPORT
+ endif
+diff --git a/linker/linker_phdr.cpp b/linker/linker_phdr.cpp
+index 30118e3..8df6198 100644
+--- a/linker/linker_phdr.cpp
++++ b/linker/linker_phdr.cpp
+@@ -137,6 +137,9 @@ ElfReader::ElfReader(const char* name, int fd, off64_t file_offset, off64_t file
+     : name_(name), fd_(fd), file_offset_(file_offset), file_size_(file_size),
+       phdr_num_(0), phdr_mmap_(nullptr), phdr_table_(nullptr), phdr_size_(0),
+       load_start_(nullptr), load_size_(0), load_bias_(0),
++#ifdef ENABLE_PRELINK_SUPPORT
++      required_base_(0),
++#endif
+       loaded_phdr_(nullptr) {
+ }
+ 
+@@ -301,6 +304,38 @@ size_t phdr_table_get_load_size(const ElfW(Phdr)* phdr_table, size_t phdr_count,
+   return max_vaddr - min_vaddr;
+ }
+ 
++#ifdef ENABLE_PRELINK_SUPPORT
++typedef struct {
++    long mmap_addr;
++    char tag[4]; /* 'P', 'R', 'E', ' ' */
++} prelink_info_t;
++
++/* Returns the requested base address if the library is prelinked,
++ * and 0 otherwise.  */
++static ElfW(Addr) is_prelinked(int fd, const char *name)
++{
++    off_t sz = lseek(fd, -sizeof(prelink_info_t), SEEK_END);
++    if (sz < 0) {
++        DL_ERR("lseek() failed!");
++        return 0;
++    }
++
++    prelink_info_t info;
++    int rc = TEMP_FAILURE_RETRY(read(fd, &info, sizeof(info)));
++    if (rc != sizeof(info)) {
++        DL_ERR("Could not read prelink_info_t structure for `%s`\n", name);
++        return 0;
++    }
++
++    if (memcmp(info.tag, "PRE ", 4)) {
++        DL_ERR("`%s` is not a prelinked library\n", name);
++        return 0;
++    }
++
++    return (unsigned long)info.mmap_addr;
++}
++#endif
++
+ // Reserve a virtual address range big enough to hold all loadable
+ // segments of a program header table. This is done by creating a
+ // private anonymous mmap() with PROT_NONE.
+@@ -311,7 +346,9 @@ bool ElfReader::ReserveAddressSpace(const android_dlextinfo* extinfo) {
+     DL_ERR("\"%s\" has no loadable segments", name_);
+     return false;
+   }
+-
++#ifdef ENABLE_PRELINK_SUPPORT
++  required_base_ = is_prelinked(fd_, name_);
++#endif
+   uint8_t* addr = reinterpret_cast<uint8_t*>(min_vaddr);
+   void* start;
+   size_t reserved_size = 0;
+@@ -339,7 +376,13 @@ bool ElfReader::ReserveAddressSpace(const android_dlextinfo* extinfo) {
+       return false;
+     }
+     int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
++#ifndef ENABLE_PRELINK_SUPPORT
+     start = mmap(mmap_hint, load_size_, PROT_NONE, mmap_flags, -1, 0);
++#else
++    if (required_base_ != 0)
++      mmap_flags |= MAP_FIXED;
++    start = mmap((void*)required_base_, load_size_, PROT_NONE, mmap_flags, -1, 0);
++#endif
+     if (start == MAP_FAILED) {
+       DL_ERR("couldn't reserve %zd bytes of address space for \"%s\"", load_size_, name_);
+       return false;
+diff --git a/linker/linker_phdr.h b/linker/linker_phdr.h
+index 3affa66..db09d80 100644
+--- a/linker/linker_phdr.h
++++ b/linker/linker_phdr.h
+@@ -49,6 +49,9 @@ class ElfReader {
+   size_t load_size() { return load_size_; }
+   ElfW(Addr) load_bias() { return load_bias_; }
+   const ElfW(Phdr)* loaded_phdr() { return loaded_phdr_; }
++#ifdef ENABLE_PRELINK_SUPPORT
++  ElfW(Addr) required_base() { return required_base_; }
++#endif
+ 
+  private:
+   bool ReadElfHeader();
+@@ -77,7 +80,11 @@ class ElfReader {
+   size_t load_size_;
+   // Load bias.
+   ElfW(Addr) load_bias_;
+-
++#ifdef ENABLE_PRELINK_SUPPORT
++  // For prelinked libraries, mandatory load address of the first
++  // loadable segment. 0 otherwise.
++  ElfW(Addr) required_base_;
++#endif
+   // Loaded phdr.
+   const ElfW(Phdr)* loaded_phdr_;
+ };
+-- 
+2.7.4
+
+
+From 419efb5c65b363430d6d48dd834b27a3e33a59c0 Mon Sep 17 00:00:00 2001
+From: sooti <sooti85@gmail.com>
+Date: Sun, 13 Dec 2015 00:46:37 -0800
+Subject: [PATCH 07/10] Revert "bionic: Remove old MD5 support"
+
+This reverts commit 06808a7f5d5ec626c505eafda065af54a9e98fb7.
+---
+ libc/Android.mk   |   5 +
+ libc/bionic/md5.c | 279 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ libc/bionic/md5.h |  50 ++++++++++
+ 3 files changed, 334 insertions(+)
+ create mode 100644 libc/bionic/md5.c
+ create mode 100644 libc/bionic/md5.h
+
+diff --git a/libc/Android.mk b/libc/Android.mk
+index 26a97c3..8ced941 100644
+--- a/libc/Android.mk
++++ b/libc/Android.mk
+@@ -66,6 +66,11 @@ libc_common_src_files := \
+     stdlib/atexit.c \
+     stdlib/exit.c \
+ 
++ifeq ($(TARGET_NEEDS_BIONIC_MD5),true)
++libc_common_src_files += \
++    bionic/md5.c
++endif
++
+ # Fortify implementations of libc functions.
+ libc_common_src_files += \
+     bionic/__FD_chk.cpp \
+diff --git a/libc/bionic/md5.c b/libc/bionic/md5.c
+new file mode 100644
+index 0000000..ba4aaed
+--- /dev/null
++++ b/libc/bionic/md5.c
+@@ -0,0 +1,279 @@
++/*
++ * Copyright (c) 1995 - 2001 Kungliga Tekniska Högskolan
++ * (Royal Institute of Technology, Stockholm, Sweden).
++ * All rights reserved.
++ * 
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 
++ * 3. Neither the name of the Institute nor the names of its contributors
++ *    may be used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ * 
++ * THIS SOFTWARE IS PROVIDED BY THE INSTITUTE AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE INSTITUTE OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++
++__RCSID("$Heimdal: md5.c,v 1.15 2001/01/29 04:33:44 assar Exp $"
++        "$NetBSD: md5.c,v 1.1.1.4 2002/09/12 12:41:42 joda Exp $");
++#endif
++
++#include <endian.h>
++#include "md5.h"
++#include "hash.h"
++
++#define A m->counter[0]
++#define B m->counter[1]
++#define C m->counter[2]
++#define D m->counter[3]
++#define X data
++
++void
++MD5_Init (struct md5 *m)
++{
++  m->sz[0] = 0;
++  m->sz[1] = 0;
++  D = 0x10325476;
++  C = 0x98badcfe;
++  B = 0xefcdab89;
++  A = 0x67452301;
++}
++
++#define F(x,y,z) CRAYFIX((x & y) | (~x & z))
++#define G(x,y,z) CRAYFIX((x & z) | (y & ~z))
++#define H(x,y,z) (x ^ y ^ z)
++#define I(x,y,z) CRAYFIX(y ^ (x | ~z))
++
++#define DOIT(a,b,c,d,k,s,i,OP) \
++a = b + cshift(a + OP(b,c,d) + X[k] + (i), s)
++
++#define DO1(a,b,c,d,k,s,i) DOIT(a,b,c,d,k,s,i,F)
++#define DO2(a,b,c,d,k,s,i) DOIT(a,b,c,d,k,s,i,G)
++#define DO3(a,b,c,d,k,s,i) DOIT(a,b,c,d,k,s,i,H)
++#define DO4(a,b,c,d,k,s,i) DOIT(a,b,c,d,k,s,i,I)
++
++static inline void
++calc (struct md5 *m, u_int32_t *data)
++{
++  u_int32_t AA, BB, CC, DD;
++
++  AA = A;
++  BB = B;
++  CC = C;
++  DD = D;
++
++  /* Round 1 */
++
++  DO1(A,B,C,D,0,7,0xd76aa478);
++  DO1(D,A,B,C,1,12,0xe8c7b756);
++  DO1(C,D,A,B,2,17,0x242070db);
++  DO1(B,C,D,A,3,22,0xc1bdceee);
++
++  DO1(A,B,C,D,4,7,0xf57c0faf);
++  DO1(D,A,B,C,5,12,0x4787c62a);
++  DO1(C,D,A,B,6,17,0xa8304613);
++  DO1(B,C,D,A,7,22,0xfd469501);
++
++  DO1(A,B,C,D,8,7,0x698098d8);
++  DO1(D,A,B,C,9,12,0x8b44f7af);
++  DO1(C,D,A,B,10,17,0xffff5bb1);
++  DO1(B,C,D,A,11,22,0x895cd7be);
++
++  DO1(A,B,C,D,12,7,0x6b901122);
++  DO1(D,A,B,C,13,12,0xfd987193);
++  DO1(C,D,A,B,14,17,0xa679438e);
++  DO1(B,C,D,A,15,22,0x49b40821);
++
++  /* Round 2 */
++
++  DO2(A,B,C,D,1,5,0xf61e2562);
++  DO2(D,A,B,C,6,9,0xc040b340);
++  DO2(C,D,A,B,11,14,0x265e5a51);
++  DO2(B,C,D,A,0,20,0xe9b6c7aa);
++
++  DO2(A,B,C,D,5,5,0xd62f105d);
++  DO2(D,A,B,C,10,9,0x2441453);
++  DO2(C,D,A,B,15,14,0xd8a1e681);
++  DO2(B,C,D,A,4,20,0xe7d3fbc8);
++
++  DO2(A,B,C,D,9,5,0x21e1cde6);
++  DO2(D,A,B,C,14,9,0xc33707d6);
++  DO2(C,D,A,B,3,14,0xf4d50d87);
++  DO2(B,C,D,A,8,20,0x455a14ed);
++
++  DO2(A,B,C,D,13,5,0xa9e3e905);
++  DO2(D,A,B,C,2,9,0xfcefa3f8);
++  DO2(C,D,A,B,7,14,0x676f02d9);
++  DO2(B,C,D,A,12,20,0x8d2a4c8a);
++
++  /* Round 3 */
++
++  DO3(A,B,C,D,5,4,0xfffa3942);
++  DO3(D,A,B,C,8,11,0x8771f681);
++  DO3(C,D,A,B,11,16,0x6d9d6122);
++  DO3(B,C,D,A,14,23,0xfde5380c);
++
++  DO3(A,B,C,D,1,4,0xa4beea44);
++  DO3(D,A,B,C,4,11,0x4bdecfa9);
++  DO3(C,D,A,B,7,16,0xf6bb4b60);
++  DO3(B,C,D,A,10,23,0xbebfbc70);
++
++  DO3(A,B,C,D,13,4,0x289b7ec6);
++  DO3(D,A,B,C,0,11,0xeaa127fa);
++  DO3(C,D,A,B,3,16,0xd4ef3085);
++  DO3(B,C,D,A,6,23,0x4881d05);
++
++  DO3(A,B,C,D,9,4,0xd9d4d039);
++  DO3(D,A,B,C,12,11,0xe6db99e5);
++  DO3(C,D,A,B,15,16,0x1fa27cf8);
++  DO3(B,C,D,A,2,23,0xc4ac5665);
++
++  /* Round 4 */
++
++  DO4(A,B,C,D,0,6,0xf4292244);
++  DO4(D,A,B,C,7,10,0x432aff97);
++  DO4(C,D,A,B,14,15,0xab9423a7);
++  DO4(B,C,D,A,5,21,0xfc93a039);
++
++  DO4(A,B,C,D,12,6,0x655b59c3);
++  DO4(D,A,B,C,3,10,0x8f0ccc92);
++  DO4(C,D,A,B,10,15,0xffeff47d);
++  DO4(B,C,D,A,1,21,0x85845dd1);
++
++  DO4(A,B,C,D,8,6,0x6fa87e4f);
++  DO4(D,A,B,C,15,10,0xfe2ce6e0);
++  DO4(C,D,A,B,6,15,0xa3014314);
++  DO4(B,C,D,A,13,21,0x4e0811a1);
++
++  DO4(A,B,C,D,4,6,0xf7537e82);
++  DO4(D,A,B,C,11,10,0xbd3af235);
++  DO4(C,D,A,B,2,15,0x2ad7d2bb);
++  DO4(B,C,D,A,9,21,0xeb86d391);
++
++  A += AA;
++  B += BB;
++  C += CC;
++  D += DD;
++}
++
++/*
++ * From `Performance analysis of MD5' by Joseph D. Touch <touch@isi.edu>
++ */
++#if !defined(__BYTE_ORDER) || !defined (__BIG_ENDIAN)
++#error __BYTE_ORDER macros not defined
++#endif
++
++#if __BYTE_ORDER == __BIG_ENDIAN
++static inline u_int32_t
++swap_u_int32_t (u_int32_t t)
++{
++  u_int32_t temp1, temp2;
++
++  temp1   = cshift(t, 16);
++  temp2   = temp1 >> 8;
++  temp1  &= 0x00ff00ff;
++  temp2  &= 0x00ff00ff;
++  temp1 <<= 8;
++  return temp1 | temp2;
++}
++#endif
++
++struct x32{
++  unsigned int a:32;
++  unsigned int b:32;
++};
++
++void
++MD5_Update (struct md5 *m, const void *v, size_t len)
++{
++  const unsigned char *p = v;
++  size_t old_sz = m->sz[0];
++  size_t offset;
++
++  m->sz[0] += len * 8;
++  if (m->sz[0] < old_sz)
++      ++m->sz[1];
++  offset = (old_sz / 8)  % 64;
++  while(len > 0){
++    size_t l = min(len, 64 - offset);
++    memcpy(m->save + offset, p, l);
++    offset += l;
++    p += l;
++    len -= l;
++    if(offset == 64){
++#if __BYTE_ORDER == __BIG_ENDIAN
++      int i;
++      u_int32_t current[16];
++      struct x32 *u = (struct x32*)m->save;
++      for(i = 0; i < 8; i++){
++	current[2*i+0] = swap_u_int32_t(u[i].a);
++	current[2*i+1] = swap_u_int32_t(u[i].b);
++      }
++      calc(m, current);
++#else
++      calc(m, (u_int32_t*)m->save);
++#endif
++      offset = 0;
++    }
++  }
++}
++
++void
++MD5_Final (void *res, struct md5 *m)
++{
++  unsigned char zeros[72];
++  unsigned offset = (m->sz[0] / 8) % 64;
++  unsigned int dstart = (120 - offset - 1) % 64 + 1;
++
++  *zeros = 0x80;
++  memset (zeros + 1, 0, sizeof(zeros) - 1);
++  zeros[dstart+0] = (m->sz[0] >> 0) & 0xff;
++  zeros[dstart+1] = (m->sz[0] >> 8) & 0xff;
++  zeros[dstart+2] = (m->sz[0] >> 16) & 0xff;
++  zeros[dstart+3] = (m->sz[0] >> 24) & 0xff;
++  zeros[dstart+4] = (m->sz[1] >> 0) & 0xff;
++  zeros[dstart+5] = (m->sz[1] >> 8) & 0xff;
++  zeros[dstart+6] = (m->sz[1] >> 16) & 0xff;
++  zeros[dstart+7] = (m->sz[1] >> 24) & 0xff;
++  MD5_Update (m, zeros, dstart + 8);
++  {
++      int i;
++      unsigned char *r = (unsigned char *)res;
++
++      for (i = 0; i < 4; ++i) {
++	  r[4*i]   = m->counter[i] & 0xFF;
++	  r[4*i+1] = (m->counter[i] >> 8) & 0xFF;
++	  r[4*i+2] = (m->counter[i] >> 16) & 0xFF;
++	  r[4*i+3] = (m->counter[i] >> 24) & 0xFF;
++      }
++  }
++#if 0
++  {
++    int i;
++    u_int32_t *r = (u_int32_t *)res;
++
++    for (i = 0; i < 4; ++i)
++      r[i] = swap_u_int32_t (m->counter[i]);
++  }
++#endif
++}
+diff --git a/libc/bionic/md5.h b/libc/bionic/md5.h
+new file mode 100644
+index 0000000..a381994
+--- /dev/null
++++ b/libc/bionic/md5.h
+@@ -0,0 +1,50 @@
++/*
++ * Copyright (c) 1995 - 2001 Kungliga Tekniska Högskolan
++ * (Royal Institute of Technology, Stockholm, Sweden).
++ * All rights reserved.
++ * 
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 
++ * 3. Neither the name of the Institute nor the names of its contributors
++ *    may be used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ * 
++ * THIS SOFTWARE IS PROVIDED BY THE INSTITUTE AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE INSTITUTE OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/* $Heimdal: md5.h,v 1.8 2001/01/29 02:08:57 assar Exp $
++   $NetBSD: md5.h,v 1.1.1.4 2002/09/12 12:41:42 joda Exp $ */
++
++#include <stdlib.h>
++#include <sys/types.h>
++
++struct md5 {
++  unsigned int sz[2];
++  u_int32_t counter[4];
++  unsigned char save[64];
++};
++
++typedef struct md5 MD5_CTX;
++
++void MD5_Init (struct md5 *m);
++void MD5_Update (struct md5 *m, const void *p, size_t len);
++void MD5_Final (void *res, struct md5 *m); /* u_int32_t res[4] */
+-- 
+2.7.4
+
+
+From 256652f4600f256b59c48efe43aba18e46d830e8 Mon Sep 17 00:00:00 2001
+From: sooti <sooti85@gmail.com>
+Date: Wed, 25 Nov 2015 09:31:56 +0100
+Subject: [PATCH 08/10] bring back hash.h for md5 build
+
+Change-Id: I8a7fd9add3d9184dd70a93f809dbce0b99060b18
+---
+ libc/bionic/hash.h | 68 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ linker/Android.mk  |  3 +--
+ 2 files changed, 69 insertions(+), 2 deletions(-)
+ create mode 100644 libc/bionic/hash.h
+
+diff --git a/libc/bionic/hash.h b/libc/bionic/hash.h
+new file mode 100644
+index 0000000..75e0d5e
+--- /dev/null
++++ b/libc/bionic/hash.h
+@@ -0,0 +1,68 @@
++/*
++ * Copyright (c) 1999 Kungliga Tekniska HÃ¶gskolan
++ * (Royal Institute of Technology, Stockholm, Sweden). 
++ * All rights reserved. 
++ *
++ * Redistribution and use in source and binary forms, with or without 
++ * modification, are permitted provided that the following conditions 
++ * are met: 
++ *
++ * 1. Redistributions of source code must retain the above copyright 
++ *    notice, this list of conditions and the following disclaimer. 
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright 
++ *    notice, this list of conditions and the following disclaimer in the 
++ *    documentation and/or other materials provided with the distribution. 
++ *
++ * 3. Neither the name of KTH nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software without
++ *    specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY KTH AND ITS CONTRIBUTORS ``AS IS'' AND ANY
++ * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL KTH OR ITS CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
++ * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
++ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
++ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
++ * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
++
++/* $Heimdal: hash.h,v 1.1 1999/03/22 19:16:25 joda Exp $
++   $NetBSD: hash.h,v 1.1.1.3 2002/09/12 12:41:42 joda Exp $ */
++
++/* stuff in common between md4, md5, and sha1 */
++
++#ifndef __hash_h__
++#define __hash_h__
++
++#include <stdlib.h>
++#include <string.h>
++
++#ifndef min
++#define min(a,b) (((a)>(b))?(b):(a))
++#endif
++
++/* Vector Crays doesn't have a good 32-bit type, or more precisely,
++   int32_t as defined by <bind/bitypes.h> isn't 32 bits, and we don't
++   want to depend in being able to redefine this type.  To cope with
++   this we have to clamp the result in some places to [0,2^32); no
++   need to do this on other machines.  Did I say this was a mess?
++   */
++
++#ifdef _CRAY
++#define CRAYFIX(X) ((X) & 0xffffffff)
++#else
++#define CRAYFIX(X) (X)
++#endif
++
++static inline u_int32_t
++cshift (u_int32_t x, unsigned int n)
++{
++    x = CRAYFIX(x);
++    return CRAYFIX((x << n) | (x >> (32 - n)));
++}
++
++#endif /* __hash_h__ */
+diff --git a/linker/Android.mk b/linker/Android.mk
+index 95eb305..609b684 100644
+--- a/linker/Android.mk
++++ b/linker/Android.mk
+@@ -42,8 +42,7 @@ LOCAL_CONLYFLAGS += \
+     -std=gnu99 \
+ 
+ LOCAL_CPPFLAGS += \
+-    -std=gnu++11 \
+-    -Wold-style-cast \
++    -std=gnu++11
+ 
+ ifeq ($(TARGET_IS_64_BIT),true)
+ LOCAL_CPPFLAGS += -DTARGET_IS_64_BIT
+-- 
+2.7.4
+
+
+From b9b0980ab811212e3efd017a148ce80023dda6f0 Mon Sep 17 00:00:00 2001
+From: Stefan Berger <s.berger81@gmail.com>
+Date: Sun, 18 Oct 2015 12:22:14 +0200
+Subject: [PATCH 09/10] bionic: Fix relocate function for non-PIE support on M
+
+Change-Id: I6dd1565dc135d68bfa4b2d1c3e6c22594a575338
+---
+ linker/linker.cpp | 30 +++++++++++++++---------------
+ 1 file changed, 15 insertions(+), 15 deletions(-)
+
+diff --git a/linker/linker.cpp b/linker/linker.cpp
+index f42813d..1c61564 100644
+--- a/linker/linker.cpp
++++ b/linker/linker.cpp
+@@ -1929,10 +1929,10 @@ bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& r
+ 
+     const ElfW(Sym)* s = nullptr;
+     soinfo* lsi = nullptr;
++    const version_info* vi = nullptr;
+ 
+     if (sym != 0) {
+       sym_name = get_string(symtab_[sym].st_name);
+-      const version_info* vi = nullptr;
+ 
+       if (!lookup_version_info(version_tracker, sym, sym_name, &vi)) {
+         return false;
+@@ -2249,9 +2249,9 @@ bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& r
+              * set to ET_EXEC.
+              */
+             DL_ERR("%s R_ARM_COPY relocations are not supported", get_realpath());
+-            return -1;
++            return false;
+ #else
+-            if ((flags & FLAG_EXE) == 0) {
++            if ((flags_ & FLAG_EXE) == 0) {
+                 /*
+                 * http://infocenter.arm.com/help/topic/com.arm.doc.ihi0044d/IHI0044D_aaelf.pdf
+                 *
+@@ -2263,34 +2263,34 @@ bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& r
+                 * We should explicitly disallow ET_DYN executables from having
+                 * R_ARM_COPY relocations.
+                 */
+-                DL_ERR("%s R_ARM_COPY relocations only supported for ET_EXEC", name);
+-                return -1;
++                DL_ERR("%s R_ARM_COPY relocations only supported for ET_EXEC", get_realpath());
++                return false;
+             }
+             count_relocation(kRelocCopy);
+             MARK(rel->r_offset);
+             TRACE_TYPE(RELO, "RELO %08x <- %d @ %08x %s", reloc, s->st_size, sym_addr, sym_name);
+             if (reloc == sym_addr) {
+-                ElfW(Sym)* src = soinfo_do_lookup(NULL, sym_name, &lsi);
++                const ElfW(Sym)* src = nullptr;
+ 
+-                if (src == NULL) {
+-                    DL_ERR("%s R_ARM_COPY relocation source cannot be resolved", name);
+-                    return -1;
++                if (!soinfo_do_lookup(NULL, sym_name, vi, &lsi, global_group, local_group, &src)) {
++                    DL_ERR("%s R_ARM_COPY relocation source cannot be resolved", get_realpath());
++                    return false;
+                 }
+                 if (lsi->has_DT_SYMBOLIC) {
+                     DL_ERR("%s invalid R_ARM_COPY relocation against DT_SYMBOLIC shared "
+-                           "library %s (built with -Bsymbolic?)", name, lsi->name);
+-                    return -1;
++                           "library %s (built with -Bsymbolic?)", get_realpath(), lsi->soname_);
++                    return false;
+                 }
+                 if (s->st_size < src->st_size) {
+                     DL_ERR("%s R_ARM_COPY relocation size mismatch (%d < %d)",
+-                           name, s->st_size, src->st_size);
+-                    return -1;
++                           get_realpath(), s->st_size, src->st_size);
++                    return false;
+                 }
+                 memcpy(reinterpret_cast<void*>(reloc),
+                        reinterpret_cast<void*>(src->st_value + lsi->load_bias), src->st_size);
+             } else {
+-                DL_ERR("%s R_ARM_COPY relocation target cannot be resolved", name);
+-                return -1;
++                DL_ERR("%s R_ARM_COPY relocation target cannot be resolved", get_realpath());
++                return false;
+             }
+             break;
+ #endif
+-- 
+2.7.4
+
+
+From 020d088fa10443d16dca23899b9c708dbae6c9ae Mon Sep 17 00:00:00 2001
+From: sooti <sooti>
+Date: Sat, 28 Nov 2015 18:07:15 +0100
+Subject: [PATCH 10/10] fix pie
+
+Change-Id: I0494e6fe9850f43a1fa41401d68e98b8fd84f434
+---
+ linker/Android.mk | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/linker/Android.mk b/linker/Android.mk
+index 609b684..e423991 100644
+--- a/linker/Android.mk
++++ b/linker/Android.mk
+@@ -33,7 +33,7 @@ LOCAL_CFLAGS += \
+     -fno-stack-protector \
+     -Wstrict-overflow=5 \
+     -fvisibility=hidden \
+-    -Wall -Wextra -Wunused -Werror \
++    -Wall -Wextra -Wunused \
+ 
+ LOCAL_CFLAGS_arm += -D__work_around_b_19059885__
+ LOCAL_CFLAGS_x86 += -D__work_around_b_19059885__
+-- 
+2.7.4
+
