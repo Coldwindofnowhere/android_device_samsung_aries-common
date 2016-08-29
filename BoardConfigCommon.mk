@@ -89,34 +89,31 @@ BOARD_KERNEL_BASE := 0x32000000
 BOARD_KERNEL_PAGESIZE := 4096
 
 BOARD_BOOTIMAGE_PARTITION_SIZE := 7864320
-BOARD_SYSTEMIMAGE_PARTITION_SIZE := 629145600
+BOARD_SYSTEMIMAGE_PARTITION_SIZE := 943718400
 BOARD_USERDATAIMAGE_PARTITION_SIZE := 1379926016
 BOARD_CACHEIMAGE_PARTITION_SIZE :=  17920
 BOARD_IMAGE_PARTITION_SIZE := 1379926016
 BOARD_FLASH_BLOCK_SIZE := 4096
 
 # Connectivity - Wi-Fi
-BOARD_NO_WIFI_HAL           := true
 BOARD_WPA_SUPPLICANT_DRIVER := NL80211
 WPA_SUPPLICANT_VERSION      := VER_0_8_X
 BOARD_WPA_SUPPLICANT_PRIVATE_LIB := lib_driver_cmd_bcmdhd
 BOARD_HOSTAPD_DRIVER        := NL80211
 BOARD_HOSTAPD_PRIVATE_LIB   := lib_driver_cmd_bcmdhd
 BOARD_WLAN_DEVICE           := bcmdhd
-BOARD_WLAN_DEVICE_REV       := bcm4329
-WIFI_DRIVER_MODULE_NAME     := "bcmdhd"
 WIFI_DRIVER_FW_PATH_PARAM   := "/sys/module/bcmdhd/parameters/firmware_path"
 WIFI_DRIVER_FW_PATH_STA     := "/vendor/firmware/fw_bcmdhd.bin"
 WIFI_DRIVER_FW_PATH_AP      := "/vendor/firmware/fw_bcmdhd_apsta.bin"
 
 # Bluetooth
-BOARD_CUSTOM_BT_CONFIG := device/samsung/aries-common/libbt_vndcfg.txt
+BOARD_CUSTOM_BT_CONFIG := device/samsung/aries-common/config/libbt_vndcfg.txt
 
 # Vold
 BOARD_VOLD_EMMC_SHARES_DEV_MAJOR := true
 TARGET_USE_CUSTOM_LUN_FILE_PATH := "/sys/devices/platform/s3c-usbgadget/gadget/lun%d/file"
 BOARD_USES_MULTIPLE_SDCARD_FS := true
-TARGET_USES_BLOCK_BASED_OTA := true
+BLOCK_BASED_OTA=false
 
 # Enable dex-preoptimization to speed up first boot sequence
 ifeq ($(HOST_OS),linux)
@@ -130,7 +127,7 @@ TARGET_USERIMAGES_USE_EXT4 := true
 TARGET_USERIMAGES_USE_F2FS := true
 BOARD_USES_BML_OVER_MTD := true
 # BOARD_CUSTOM_BOOTIMG_MK := device/samsung/aries-common/shbootimg.mk
-TARGET_RECOVERY_FSTAB := device/samsung/aries-common/fstab.aries
+TARGET_RECOVERY_FSTAB := device/samsung/aries-common/rootdir/fstab.aries
 RECOVERY_FSTAB_VERSION := 2
 
 # Open Source Charging Mode
@@ -142,7 +139,6 @@ TARGET_BOOTANIMATION_USE_RGB565 := true
 
 # Hardware rendering
 USE_OPENGL_RENDERER := true
-BOARD_EGL_CFG := device/samsung/aries-common/egl.cfg
 BOARD_EGL_SYSTEMUI_PBSIZE_HACK := true
 
 # OMX buffer reallocate
