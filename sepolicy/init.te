@@ -42,7 +42,7 @@ allow init vfat:dir { create_dir_perms relabelfrom relabelto };
 allow init vfat:lnk_file { create_file_perms relabelfrom relabelto };
 
 allow init shell_data_file:file { create_file_perms relabelfrom relabelto };
-allow init shell_data_file:dir { create_dir_perms relabelfrom relabelto };
+# allow init shell_data_file:dir { create_dir_perms relabelfrom relabelto };
 # allow init shell_data_file:lnk_file { create_file_perms relabelfrom relabelto };
 
 allow init init_tmpfs:file { create_file_perms relabelfrom relabelto };
@@ -50,9 +50,10 @@ allow init init_tmpfs:dir { create_dir_perms relabelfrom relabelto };
 allow init init_tmpfs:lnk_file { create_file_perms relabelfrom relabelto };
 
 allow init shell_data_file:file { create_file_perms relabelfrom relabelto };
-allow init shell_data_file:dir { create_dir_perms relabelfrom relabelto };
+# allow init shell_data_file:dir { create_dir_perms relabelfrom relabelto };
 # allow init shell_data_file:lnk_file { create_file_perms relabelfrom relabelto };
 
+allow init shell_data_file:dir relabelfrom;
 allow init untrusted_app:process { signal };
 allow init adb_device:chr_file getattr;
 allow init app_data_file:lnk_file { getattr setattr };
