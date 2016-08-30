@@ -65,9 +65,6 @@ TARGET_KERNEL_SOURCE := kernel/samsung/aries
 # Releasetools
 TARGET_RELEASETOOLS_EXTENSIONS := device/samsung/aries-common
 
-# Browser
-TARGET_USES_AOSP_BROWSER := true
-
 # Camera
 USE_CAMERA_STUB := false
 ifeq ($(USE_CAMERA_STUB),false)
@@ -139,7 +136,6 @@ TARGET_BOOTANIMATION_USE_RGB565 := true
 
 # Hardware rendering
 USE_OPENGL_RENDERER := true
-BOARD_EGL_SYSTEMUI_PBSIZE_HACK := true
 
 # OMX buffer reallocate
 BOARD_CANT_REALLOCATE_OMX_BUFFERS := true

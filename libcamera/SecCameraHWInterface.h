@@ -29,6 +29,14 @@
 #include <camera/CameraParameters.h>
 
 namespace android {
+    
+    struct AriesCameraInfo {
+        
+        int facing;
+        int orientation;
+        
+        };
+    
     class CameraHardwareSec : public virtual RefBase {
 public:
     virtual void        setCallbacks(camera_notify_callback notify_cb,
