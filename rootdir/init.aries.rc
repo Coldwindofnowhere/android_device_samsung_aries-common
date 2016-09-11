@@ -293,7 +293,7 @@ service charger /sbin/healthd -c
     critical
     seclabel u:r:healthd:s0
 
-on property:ril.bt_macaddr=*
+on property:ril.bt_macaddr=* && ril.wifi_macaddr=*
     start bdaddr
 
 # bugreport is triggered by holding down volume down, volume up and power
