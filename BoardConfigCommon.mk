@@ -76,6 +76,9 @@ TARGET_RELEASETOOLS_EXTENSIONS := device/samsung/aries-common
 # Browser
 TARGET_USES_AOSP_BROWSER := true
 
+# Triple FrameBuffer
+NUM_FRAMEBUFFER_SURFACE_BUFFERS := 3
+
 # Camera
 USE_CAMERA_STUB := false
 ifeq ($(USE_CAMERA_STUB),false)
