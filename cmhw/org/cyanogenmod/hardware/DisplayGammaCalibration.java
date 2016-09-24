@@ -16,8 +16,7 @@
 
 package org.cyanogenmod.hardware;
 
-import java.io.File;
-import org.cyanogenmod.hardware.util.FileUtils;
+import org.cyanogenmod.internal.util.FileUtils;
 
 public class DisplayGammaCalibration {
     private static final String[] GAMMA_FILE_PATH = new String[] {
@@ -27,7 +26,7 @@ public class DisplayGammaCalibration {
     };
 
     public static boolean isSupported() {
-        return new File(GAMMA_FILE_PATH[0]).exists();
+        return FileUtils.isFileWritable(GAMMA_FILE_PATH[0]);
     }
 
     public static int getNumberOfControls() {
